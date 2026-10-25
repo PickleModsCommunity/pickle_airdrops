@@ -1,3 +1,30 @@
+local captures, deploymentBusy = {}, {}
+local function identity(src)
+    if ESX then
+        local p = ESX.GetPlayerFromId(src)
+        return p and p.identifier
+    elseif QBCore then
+        local p = QBCore.Functions.GetPlayer(src)
+        return p and p.PlayerData.citizenid
+    end
+end
+local function saveDrops()
+    SetResourceKvp('activeDrops', json.encode(Airdrops))
+end
+local function eligible(src, drop, container)
+    local ped = GetPlayerPed(src)
+    return identity(src) and ped ~= 0 and GetEntityHealth(ped) > 0
+        and GetPlayerRoutingBucket(src) == (drop.bucket or 0)
+        and #(GetEntityCoords(ped) - container.location.coords) <= 5.0
+        and container.timerStarted and os.time() >= container.timerStarted + container.unlockTime
+end
+local function clearCapture(src)
+    captures[src] = nil
+end
+AddEventHandler('playerDropped', function() clearCapture(source); deploymentBusy[source] = nil end)
+AddEventHandler('esx:playerLogout', function(src) clearCapture(src or source) end)
+AddEventHandler('QBCore:Server:OnPlayerUnload', function(src) clearCapture(src or source) end)
+
 function GetRandomPointInCircle(center, radius)
     local angle = math.random() * 2 * math.pi
     local r = math.sqrt(math.random()) * radius
@@ -47,7 +74,7 @@ function InitializeAirdrop(data)
             unlockTime = unlockTime,
             lootingPlayers = {},
             vehicle = container.vehicle or nil,
-            dropModel = container.dropModel,
+            dropModel = container.dropModel or `sm_prop_smug_crate_01a`,
             items = container.items,
             maxSlots = #container.items,
         })
@@ -55,6 +82,9 @@ function InitializeAirdrop(data)
     end
     Airdrops[id] = {
         id = id,
+        createdAt = os.time(),
+        expiresAt = os.time() + (Config.Airdrops.lifetime or 3600),
+        bucket = data.bucket or 0,
         radius = radius,
         coords = data.coords,
         heading = data.heading,
@@ -65,7 +95,14 @@ function InitializeAirdrop(data)
         parachuteModel = data.parachuteModel or  `gr_prop_gr_para_s_01`,
         containers = airdropContainers
     }
+    -- Original speeds are units per frame at 60 FPS; landing is now server-owned.
+    local flight = 1000 / 60 + (Config.Airdrops.skyHeight - 10) / (Config.Airdrops.dropSpeed * 60)
+    for _, container in pairs(airdropContainers) do
+        container.timerStarted = os.time() + math.ceil(flight)
+    end
+    saveDrops()
     TriggerClientEvent("pickle_airdrops:startAirdrop", -1, id, Airdrops[id])
+    return id
 end
 
 exports("InitializeAirdrop", InitializeAirdrop)
@@ -148,7 +185,7 @@ function StartAirdropTemplate(templateId, data)
         end
     end
 
-    InitializeAirdrop({
+    return InitializeAirdrop({
         coords = data.coords,
         heading = data.heading,
         unlockTime = templateCfg.unlockTime or Config.Airdrops.defaultUnlockTime,
@@ -164,118 +201,115 @@ end
 
 exports("StartAirdropTemplate", StartAirdropTemplate)
 
-RegisterNetEvent("pickle_airdrops:startContainerTimer", function(id)
-    local source = source
-    local airdrop = Airdrops[id]
-    if not airdrop then return end
-    local airdropContainer = airdrop.containers[1]
-    if not airdropContainer or airdropContainer.timerStarted then return end
-    local timerStarted = os.time()
-    for containerId, container in pairs(airdrop.containers) do
-        container.timerStarted = timerStarted
-    end
-    TriggerClientEvent("pickle_airdrops:startContainerTimer", -1, id, timerStarted)
+-- Clients cannot advance the landing clock.
+RegisterNetEvent("pickle_airdrops:updateAirdropContainerItemStatus", function(id, containerId, slot, status)
+    local src = source
+    clearCapture(src)
+    if status ~= true then return end
+    local drop = Airdrops[id]
+    local container = drop and drop.containers[containerId]
+    local item = container and container.items[slot]
+    if not item or not eligible(src, drop, container) then return end
+    captures[src] = {id = id, containerId = containerId, slot = slot,
+        identity = identity(src), started = os.time()}
 end)
 
 RegisterNetEvent("pickle_airdrops:takeAirdropContainerItem", function(id, containerId, slot)
-    local currentTime = os.time()
-    local source = source
-    local airdrop = Airdrops[id]
-    if not airdrop then return end
-    local airdropContainer = airdrop.containers[containerId]
-    if not airdropContainer then return end
-    if airdropContainer.vehicle then
-        if not ConfigSV.AddOwnedVehicle then 
-            print("^1ERROR:^0 ConfigSV.AddOwnedVehicle is not set, cannot take vehicle from airdrop container.")
-            return
+    local src = source
+    local capture = captures[src]
+    local drop = Airdrops[id]
+    local container = drop and drop.containers[containerId]
+    local item = container and container.items[slot]
+    if not capture or not item or item.busy or capture.id ~= id or capture.containerId ~= containerId
+        or capture.slot ~= slot or capture.identity ~= identity(src) or not eligible(src, drop, container)
+        or os.time() - capture.started < (item.captureTime or Config.Airdrops.defaultItemCaptureTime) then return end
+    clearCapture(src)
+    item.busy = true -- reservation survives adapter yields
+    local ok, result = pcall(function()
+        if item.itemType == 'vehicle' then return ConfigSV.AddOwnedVehicle(src, item.model) end
+        if item.itemType == 'money' or item.itemType == 'dirty_money' then
+            return AddMoney(src, item.count, item.itemType == 'money' and 'money' or 'dirty')
+        elseif item.itemType == 'weapon' then
+            return Inventory.AddWeapon(src, item.name, item.count)
         end
-        if not airdropContainer.items[slot] then return end
-        local item = airdropContainer.items[slot]
-        if not item then
-            ShowNotification(source, _L("invalid_item"))
-            return
-        end
-        local plate = ConfigSV.AddOwnedVehicle(source, item.model)
+        return Inventory.AddItem(src, item.name, item.count)
+    end)
+    item.busy = nil
+    if not ok or not result then
+        ShowNotification(src, 'Reward could not be delivered. Please try again.')
+        return
+    end
+    container.items[slot] = nil
+    if item.itemType == 'vehicle' then
         Airdrops[id] = nil
-        TriggerClientEvent("pickle_airdrops:removeAirdrop", -1, id)
-        TriggerClientEvent("pickle_airdrops:replicateVehicle", source, {coords = airdrop.coords, heading = airdrop.heading, model = item.model, plate = plate})
-        if ConfigSV.GiveKeys then
-            ConfigSV.GiveKeys(source, plate)
+        TriggerClientEvent('pickle_airdrops:removeAirdrop', -1, id)
+        if capture.identity == identity(src) then
+            TriggerClientEvent('pickle_airdrops:replicateVehicle', src, {coords = drop.coords, heading = drop.heading, model = item.model, plate = result})
+            if ConfigSV.GiveKeys then ConfigSV.GiveKeys(src, result) end
         end
     else
-        local item = airdropContainer.items[slot]
-        if not item then return end
-        local lootingPlayer = airdropContainer.lootingPlayers[source]
-        if not lootingPlayer or lootingPlayer.slot ~= slot or currentTime - lootingPlayer.statusTime < (item.captureTime - 2) then
-            ShowNotification(source, "nice try bud, get banned")
-            return
-        end
-        if item.itemType == "money" or item.itemType == "dirty_money" then
-            AddMoney(source, item.count, item.itemType == "money" and "money" or "dirty")
-        elseif item.itemType == "weapon" then
-            Inventory.AddWeapon(source, item.name, item.count)
-        else
-            Inventory.AddItem(source, item.name, item.count)
-        end
-        airdropContainer.items[slot] = nil
-        local remainingItems = 0
-        for index, item in pairs(airdropContainer.items) do
-            if item then
-                remainingItems = remainingItems + 1
+        TriggerClientEvent('pickle_airdrops:updateAirdropContainerItems', -1, id, containerId, container.items)
+        if not next(container.items) then
+            drop.containers[containerId] = nil
+            TriggerClientEvent('pickle_airdrops:removeAirdropContainer', -1, id, containerId)
+            if not next(drop.containers) then
+                Airdrops[id] = nil
+                TriggerClientEvent('pickle_airdrops:removeAirdrop', -1, id)
             end
-        end
-        TriggerClientEvent("pickle_airdrops:updateAirdropContainerItems", -1, id, containerId, airdropContainer.items)
-        if remainingItems == 0 then
-            Airdrops[id].containers[containerId] = nil
-            local remainingContainers = 0
-            for _, container in pairs(Airdrops[id].containers) do
-                if container then
-                    remainingContainers = remainingContainers + 1
-                end
-            end
-            SetTimeout(1000, function()
-                if remainingContainers == 0 then
-                    Airdrops[id] = nil
-                    TriggerClientEvent("pickle_airdrops:removeAirdrop", -1, id)
-                else
-                    TriggerClientEvent("pickle_airdrops:removeAirdropContainer", -1, id, containerId)
-                end
-            end)
         end
     end
+    saveDrops()
 end)
 
-RegisterNetEvent("pickle_airdrops:updateAirdropContainerItemStatus", function(id, containerId, slot, status)
-    local source = source
-    local airdrop = Airdrops[id]
-    if not airdrop then return end
-    local airdropContainer = airdrop.containers[containerId]
-    if not airdropContainer or airdropContainer.unlockTime - (os.time() - airdropContainer.timerStarted) > 0 then return end
-    airdropContainer.lootingPlayers[source] = status and {
-        slot = slot,
-        statusTime = os.time(),
-        status = status,
-    } or nil
+RegisterNetEvent('pickle_airdrops:initializePlayer', function()
+    local src = source
+    clearCapture(src)
+    TriggerClientEvent('pickle_airdrops:setupInventory', src, {items = Inventory.Items})
+    for id, drop in pairs(Airdrops) do
+        TriggerClientEvent('pickle_airdrops:startAirdrop', src, id, drop)
+    end
 end)
+RegisterNetEvent('pickle_airdrops:exitAirdropContainer', function() clearCapture(source) end)
 
-RegisterNetEvent("pickle_airdrops:initializePlayer", function()
-    local source = source
-    -- StartAirdropTemplate("default", {
-    --     coords = GetEntityCoords(GetPlayerPed(source)),
-    --     heading = GetEntityHeading(GetPlayerPed(source)),
-    --     containers = 5,
-    -- })
-    TriggerClientEvent("pickle_airdrops:setupInventory", source, {items = Inventory.Items})
-end)
-
-RegisterNetEvent("pickle_airdrops:exitAirdropContainer", function(id, containerId)
-    local source = source
-    local airdrop = Airdrops[id]
-    if not airdrop then return end
-    local airdropContainer = airdrop.containers[containerId]
-    if not airdropContainer then return end
-    if airdropContainer.lootingPlayers[source] then
-        airdropContainer.lootingPlayers[source] = nil
+CreateThread(function()
+    local raw = GetResourceKvpString('activeDrops')
+    local ok, saved = pcall(json.decode, raw or '{}')
+    if ok and type(saved) == 'table' then
+        for id, drop in pairs(saved) do
+            if drop.expiresAt and drop.expiresAt > os.time() then
+                drop.coords = vector3(drop.coords.x, drop.coords.y, drop.coords.z)
+                local containers = {}
+                for key, c in pairs(drop.containers) do
+                    c.location.coords = vector3(c.location.coords.x, c.location.coords.y, c.location.coords.z)
+                    local items = {}
+                    for slot, item in pairs(c.items) do item.busy = nil; items[tonumber(slot) or slot] = item end
+                    c.items = items
+                    containers[tonumber(key) or key] = c
+                end
+                drop.containers = containers
+                Airdrops[id] = drop
+            end
+        end
+    end
+    while true do
+        Wait(250)
+        for src, capture in pairs(captures) do
+            local drop = Airdrops[capture.id]
+            local c = drop and drop.containers[capture.containerId]
+            if not c or capture.identity ~= identity(src) or not eligible(src, drop, c)
+                or os.time() - capture.started > 600 then clearCapture(src) end
+        end
+        for id, drop in pairs(Airdrops) do
+            local busy = false
+            for _, c in pairs(drop.containers) do
+                for _, item in pairs(c.items) do if item.busy then busy = true end end
+            end
+            if drop.expiresAt <= os.time() and not busy then
+                Airdrops[id] = nil
+                TriggerClientEvent('pickle_airdrops:removeAirdrop', -1, id)
+                saveDrops()
+            end
+        end
     end
 end)
 
@@ -309,22 +343,22 @@ end)
 CreateThread(function()
     for k,v in pairs(Config.AirdropTemplates) do 
         RegisterUsableItem(v.item, function(source)
-            Inventory.RemoveItem(source, v.item, 1)
-            local coords = GetEntityCoords(GetPlayerPed(source)) + vector3(
-                math.random(2, 5) * (math.random(1, 2) == 1 and 1 or -1), 
-                math.random(2, 5) * (math.random(1, 2) == 1 and 1 or -1), 
-                0.0
-            )
-            local heading = GetEntityHeading(GetPlayerPed(source))
-            local dropTemplate = Config.AirdropTemplates[k]
-            SetTimeout(4000, function()
-                ShowNotification(source, _L("airdrop_incoming"))
-                StartAirdropTemplate(k, {
-                    coords = coords,
-                    heading = heading,
-                    containers = dropTemplate.containers or 1,
-                })
-            end)
+            if deploymentBusy[source] or not identity(source) then return end
+            deploymentBusy[source] = true
+            local ped = GetPlayerPed(source)
+            local coords, heading = GetEntityCoords(ped), GetEntityHeading(ped)
+            if Inventory.RemoveItem(source, v.item, 1) ~= true then
+                deploymentBusy[source] = nil
+                return
+            end
+            local ok, err = pcall(StartAirdropTemplate, k, {
+                coords = coords, heading = heading, containers = v.containers or 1,
+            })
+            if not ok then
+                Inventory.AddItem(source, v.item, 1)
+                print('Airdrop deployment failed: ' .. tostring(err))
+            end
+            deploymentBusy[source] = nil
             TriggerClientEvent("pickle_airdrops:playAirdropPlacement", source)
         end)
         if v.cronSchedule then 
