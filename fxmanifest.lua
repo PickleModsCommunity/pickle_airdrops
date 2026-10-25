@@ -2,7 +2,7 @@ fx_version "cerulean"
 game "gta5"
 author "Pickle Mods"
 description "The best system for airdrops in FiveM."
-version "v1.0.4"
+version "v1.0.5"
 
 ui_page "nui/index.html"
 
