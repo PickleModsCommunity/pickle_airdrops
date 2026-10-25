@@ -38,6 +38,7 @@ server_scripts {
 	"config_sv.lua",
 }
 
+dependencies { 'ox_lib', 'mysql-async' }
 lua54 'yes'
 
 escrow_ignore {

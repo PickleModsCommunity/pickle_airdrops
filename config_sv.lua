@@ -41,51 +41,23 @@ ConfigSV.WebhookHandler = function(webhookId, fields)
 end
 
 ConfigSV.AddOwnedVehicle = function(source, model)
-    if GetResourceState('es_extended') == 'started' then 
-        -- ESX
-        local xPlayer = ESX.GetPlayerFromId(source)
-        local plate = ""
-        local letters = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
-        local numbers = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
-        for i = 1, 3 do
-            plate = plate .. letters[math.random(1, #letters)]
-        end
-        plate = plate .. " "
-        for i = 1, 3 do
-            plate = plate .. numbers[math.random(1, #numbers)]
-        end
-        MySQL.Async.execute("INSERT INTO owned_vehicles (owner, plate, vehicle) VALUES (@owner, @plate, @vehicle);", {
-            ['@owner'] = xPlayer.identifier,
-            ['@plate'] = plate,
-            ['@vehicle'] = json.encode({
-                plate = toupper(plate),
-                model = joaat(model),
-            }),
-        })
-        return plate
+    local plate = string.format('%03d %03d', math.random(0, 999), math.random(0, 999))
+    local result = promise.new()
+    if GetResourceState('es_extended') == 'started' then
+        local p = ESX.GetPlayerFromId(source)
+        if not p then return false end
+        MySQL.Async.execute('INSERT INTO owned_vehicles (owner, plate, vehicle) VALUES (@owner, @plate, @vehicle)', {
+            ['@owner'] = p.identifier, ['@plate'] = plate,
+            ['@vehicle'] = json.encode({plate = plate, model = joaat(model)}),
+        }, function(rows) result:resolve(rows == 1) end)
     else
-        -- QB / QBX
-        local xPlayer = QBCore.Functions.GetPlayer(tonumber(source))
-        local plate = ""
-        local letters = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
-        local numbers = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
-        for i = 1, 3 do
-            plate = plate .. letters[math.random(1, #letters)]
-        end
-        plate = plate .. " "
-        for i = 1, 3 do
-            plate = plate .. numbers[math.random(1, #numbers)]
-        end
-        MySQL.Async.fetchAll('INSERT INTO player_vehicles (license, citizenid, vehicle, hash, plate, garage, state) VALUES (@license, @citizenid, @vehicle, @hash, @plate, @garage, @state)',
-        {
-            ['@license'] = xPlayer.PlayerData.license,
-            ['@citizenid'] = xPlayer.PlayerData.citizenid,
-            ['@vehicle'] = model,
-            ['@hash'] = joaat(model),
-            ['@plate'] = toupper(plate),
-            ['@garage'] = "pillboxgarage",
-            ['@state'] = 0
-        })
-        return plate
+        local p = QBCore.Functions.GetPlayer(source)
+        if not p then return false end
+        MySQL.Async.execute('INSERT INTO player_vehicles (license, citizenid, vehicle, hash, plate, garage, state) VALUES (@license, @citizenid, @vehicle, @hash, @plate, @garage, @state)', {
+            ['@license'] = p.PlayerData.license, ['@citizenid'] = p.PlayerData.citizenid,
+            ['@vehicle'] = model, ['@hash'] = joaat(model), ['@plate'] = plate,
+            ['@garage'] = 'pillboxgarage', ['@state'] = 0,
+        }, function(rows) result:resolve(rows == 1) end)
     end
+    return Citizen.Await(result) and plate or false
 end

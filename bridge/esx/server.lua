@@ -58,14 +58,13 @@ function CheckPermission(source, permission)
 end
 
 function AddMoney(source, count, currency)
-    local xPlayer = ESX.GetPlayerFromId(source)
-    local currency = currency or "money"
-    if (currency == "money") then
-        xPlayer.addMoney(count)
-    elseif (currency == "dirty") then
-        xPlayer.addAccountMoney("black_money", count)
-    end
-    TriggerClientEvent("pickle_airdrops:updateMoney", source, GetMoney(source, currency))
+    currency = currency or 'money'
+    if not GetPlayerName(source) then return false end
+    local before = GetMoney(source, currency)
+    local p = ESX.GetPlayerFromId(source)
+    if not p then return false end
+    if currency == 'dirty' then p.addAccountMoney('black_money', count) else p.addMoney(count) end
+    return GetMoney(source, currency) == before + count
 end
 
 function RemoveMoney(source, count, currency)
@@ -214,31 +213,42 @@ CreateThread(function()
     end
 
     Inventory.UpdateInventory = function(source)
+        local owner = GetPlayerName(source) and GetIdentifier(source)
         SetTimeout(1000, function()
-            TriggerClientEvent("pickle_airdrops:updateInventory", source, Inventory.GetInventory(source))
+            if GetPlayerName(source) and GetIdentifier(source) == owner then
+                TriggerClientEvent("pickle_airdrops:updateInventory", source, Inventory.GetInventory(source))
+            end
         end)
     end
 
     Inventory.AddItem = function(source, name, count, metadata) -- Metadata is not required.
         local xPlayer = ESX.GetPlayerFromId(source)
+        if not xPlayer or not Inventory.CanCarryItem(source, name, count) then return false end
+        local before = Inventory.GetItemCount(source, name)
         xPlayer.addInventoryItem(name, count)
         Inventory.UpdateInventory(source)
+        return Inventory.GetItemCount(source, name) == before + count
     end
 
     Inventory.RemoveItem = function(source, name, count)
         local xPlayer = ESX.GetPlayerFromId(source)
+        if not xPlayer then return false end
+        local before = Inventory.GetItemCount(source, name)
+        if before < count then return false end
         xPlayer.removeInventoryItem(name, count)
         Inventory.UpdateInventory(source)
+        return Inventory.GetItemCount(source, name) == before - count
     end
 
     Inventory.AddWeapon = function(source, name, count, metadata) -- Metadata is not required.
         if Config.WeaponsAreItems then 
-            Inventory.AddItem(source, name, count, metadata)
-            return
+            return Inventory.AddItem(source, name, count, metadata)
         end
         local xPlayer = ESX.GetPlayerFromId(source)
+        if not xPlayer or xPlayer.hasWeapon(name) then return false end
         xPlayer.addWeapon(name, 0)
         Inventory.UpdateInventory(source)
+        return xPlayer.hasWeapon(name)
     end
 
     Inventory.RemoveWeapon = function(source, name, count)

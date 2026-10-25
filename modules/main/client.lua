@@ -64,9 +64,14 @@ function CreateLocalAirdrop(id, data)
         heading = data.heading,
         containers = data.containers,
     }
+    for _, c in pairs(data.containers) do
+        c.unlockDuration = c.unlockTime
+    end
     local dropModel = data.dropModel
     local parachuteModel = data.parachuteModel
     local dropType = LocalAirdrops[id].dropType
+    local elapsed = math.max(0, GetCloudTimeAsInt() - (data.createdAt or GetCloudTimeAsInt()))
+    local animationStart = GetGameTimer() - elapsed * 1000
     local planeSpeed = Config.Airdrops.planeSpeed
     local dropSpeed = Config.Airdrops.dropSpeed
     local skyHeight = Config.Airdrops.skyHeight
@@ -87,10 +92,8 @@ function CreateLocalAirdrop(id, data)
         while LocalAirdrops[id] do
             local airdrop = LocalAirdrops[id]
             for containerId, container in pairs(airdrop.containers) do
-                if container.unlockTime <= 0 then
-                    container.unlockTime = 0
-                elseif container.timerStarted then
-                    container.unlockTime = container.unlockTime - 1
+                if container.timerStarted then
+                    container.unlockTime = math.max(0, container.timerStarted + container.unlockDuration - GetCloudTimeAsInt())
                 end 
             end
             Wait(1000)
@@ -101,9 +104,10 @@ function CreateLocalAirdrop(id, data)
         while LocalAirdrops[id] do
             local airdrop = LocalAirdrops[id]
             if airdrop.planeObject then
-                planeCoords = planeCoords + forwardVector * planeSpeed
+                local seconds = (GetGameTimer() - animationStart) / 1000
+                planeCoords = vector3(data.coords.x, data.coords.y, data.coords.z + skyHeight) + forwardVector * (math.min(seconds * 60, 2000) - 1000) * planeSpeed
                 SetEntityCoords(LocalAirdrops[id].planeObject, planeCoords.x, planeCoords.y, planeCoords.z)
-                if #(planeCoords - planeDespawnCoords) < 50.0 then
+                if (GetGameTimer() - animationStart) / 1000 >= 2000 / 60 then
                     DeleteEntity(airdrop.planeObject)
                     DeleteEntity(airdrop.plane)
                     RemoveScriptedBlip(airdrop.planeBlip)
@@ -116,7 +120,7 @@ function CreateLocalAirdrop(id, data)
                 if not airdrop.dropObject then
                     local target2d = vector3(data.coords.x, data.coords.y, 0.0)
                     local plane2d = vector3(planeCoords.x, planeCoords.y, 0.0)
-                    if #(target2d - plane2d) < 10.0 then
+                    if (GetGameTimer() - animationStart) / 1000 >= 1000 / 60 then
                         if (dropType == "vehicle") then
                             airdrop.dropObject = CreateVeh(GetHashKey(dropModel), dropCoords.x, dropCoords.y, dropCoords.z, data.heading, false, false)
                         else
@@ -138,13 +142,12 @@ function CreateLocalAirdrop(id, data)
                         end
                     end
                 elseif #(dropCoords - data.coords) > 1.0 then
-                    dropCoords = dropCoords - vector3(0.0, 0.0, dropSpeed)
+                    local descent = math.max(0, (GetGameTimer() - animationStart) / 1000 - 1000 / 60)
+                    dropCoords = vector3(data.coords.x, data.coords.y, math.max(data.coords.z, data.coords.z + skyHeight - 10.0 - descent * dropSpeed * 60))
                     SetEntityCoordsNoOffset(airdrop.dropObject, dropCoords.x, dropCoords.y, dropCoords.z)
                 else
                     landed = true
-                    if not airdrop.containers[1].timerStarted then
-                        TriggerServerEvent("pickle_airdrops:startContainerTimer", id)
-                    end
+                    -- Landing and unlock deadlines are supplied by the server.
                     SetEntityCoords(airdrop.dropObject, data.coords.x, data.coords.y, data.coords.z)
                     if dropType == "vehicle" then
                         SetVehicleOnGroundProperly(airdrop.dropObject)
@@ -416,12 +419,13 @@ RegisterNUICallback("pageLoaded", function(data, cb)
 end)
 
 RegisterNUICallback("exitInterface", function(data, cb)
-    if not CurrentAirdropContainer then return end
+    if not CurrentAirdropContainer then cb("ok"); return end
     ExitAirdropContainer()
     cb("ok")
 end)
 
 RegisterNUICallback("updateAirdropContainerItemStatus", function(data, cb)
+    if not CurrentAirdropContainer or type(data) ~= "table" then cb("closed"); return end
     ClearPedTasks(PlayerPedId())
     if data.status then
         local dict = "oddjobs@shop_robbery@rob_till"
@@ -441,6 +445,7 @@ RegisterNUICallback("updateAirdropContainerItemStatus", function(data, cb)
 end)
 
 RegisterNUICallback("takeAirdropContainerItem", function(data, cb)
+    if not CurrentAirdropContainer or type(data) ~= "table" then cb("closed"); return end
     TriggerServerEvent("pickle_airdrops:takeAirdropContainerItem",  CurrentAirdropContainer.id, CurrentAirdropContainer.containerId, data.slot)
     cb("ok")
 end)
